@@ -1,0 +1,19 @@
+Metadata-Version: 2.1
+Name: consistency-models
+Version: 0.0.0
+License-File: LICENSE
+Requires-Dist: blobfile>=1.0.5
+Requires-Dist: torch==2.0.0
+Requires-Dist: tqdm
+Requires-Dist: numpy
+Requires-Dist: scipy
+Requires-Dist: pandas
+Requires-Dist: Cython
+Requires-Dist: piq==0.7.0
+Requires-Dist: joblib==0.14.0
+Requires-Dist: albumentations==0.4.3
+Requires-Dist: lmdb
+Requires-Dist: clip@ git+https://github.com/openai/CLIP.git
+Requires-Dist: mpi4py
+Requires-Dist: flash-attn==0.2.8
+Requires-Dist: pillow
