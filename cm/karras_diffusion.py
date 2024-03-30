@@ -2,6 +2,7 @@
 Based on: https://github.com/crowsonkb/k-diffusion
 """
 import random
+import math
 
 import numpy as np
 import torch as th
@@ -50,6 +51,8 @@ class KarrasDenoiser:
         lambda_vel_rcxyz=0.,
         lambda_fc=0.,
         lambda_cat=0.05,
+        beta_d = 19.9,
+        beta_min = 0.1,
     ):
         self.sigma_data = sigma_data
         self.sigma_max = sigma_max
@@ -78,6 +81,9 @@ class KarrasDenoiser:
         self.cat_loss = nn.CrossEntropyLoss()
         self.lambda_cat = lambda_cat
 
+        self.beta_d = beta_d
+        self.beta_min = beta_min
+
         if self.lambda_rcxyz > 0. or self.lambda_vel > 0. or self.lambda_root_vel > 0. or \
                 self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0.:
             assert self.loss_type == LossType.MSE, 'Geometric losses are supported by MSE loss type only!'
@@ -87,10 +93,23 @@ class KarrasDenoiser:
     def get_sigmas(self, sigmas):
         return sigmas
 
+    def get_sigmas_ddpm(self, t):
+        dummy = math.exp(1/2*self.beta_d*(t**2) + self.beta_min*t) - 1
+        sigmas = math.sqrt(dummy)
+
+        return sigmas
+
     def get_scalings(self, sigma):
         c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
         c_out = sigma * self.sigma_data / (sigma**2 + self.sigma_data**2) ** 0.5
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
+        return c_skip, c_out, c_in
+    
+    def get_scalings_ddpm(self, sigma):
+        c_skip = 1
+        c_out = -sigma
+        c_in = 1 / (sigma**2 + 1)
+
         return c_skip, c_out, c_in
 
     def get_scalings_for_boundary_condition(self, sigma):
@@ -105,7 +124,7 @@ class KarrasDenoiser:
         c_in = 1 / (sigma**2 + self.sigma_data**2) ** 0.5
         return c_skip, c_out, c_in
 
-    def training_losses(self, model, given_objs, given_cats, y, x_start, sigmas, model_kwargs=None, noise=None): 
+    def training_losses(self, model, mask, given_objs, given_cats, x_start, target_cat, y, sigmas, model_kwargs=None, noise=None): 
         if model_kwargs is None:
             model_kwargs = {}
         if noise is None:
@@ -115,8 +134,13 @@ class KarrasDenoiser:
 
         dims = x_start.ndim
         x_t = x_start + noise * append_dims(sigmas, dims)
-        model_output, denoised = self.denoise(model, given_objs, given_cats, y, x_t, sigmas, **model_kwargs)
+        model_output, denoised, predicted_cat = self.denoise(model, given_objs, given_cats, y, x_t, sigmas, **model_kwargs)
 
+
+        cat_loss = self.cat_loss(predicted_cat, target_cat)
+        cat_loss *= self.lambda_cat
+        terms["cat_loss"] = cat_loss
+        
         snrs = self.get_snr(sigmas)
         weights = append_dims(
             get_weightings(self.weight_schedule, snrs, self.sigma_data), dims
@@ -134,8 +158,7 @@ class KarrasDenoiser:
     def consistency_losses( #equation 7
         self,
         model,
-        given_objs, given_cats, y,
-        x_start,
+        mask, given_objs, given_cats, x_start, target_cat, y,
         num_scales,
         model_kwargs=None,
         target_model=None,
@@ -150,14 +173,14 @@ class KarrasDenoiser:
 
         dims = x_start.ndim
 
-        def denoise_fn(x, given_objs, given_cats, y, t):
-            return self.denoise(model,given_objs, given_cats, y, x, t, **model_kwargs)[1]
+        def denoise_fn(x, mask, given_objs, given_cats, target_cat, y, t):
+            return self.denoise(self, model, mask, given_objs, given_cats, y, x, t, **model_kwargs)[1]
 
         if target_model:
 
             @th.no_grad()
-            def target_denoise_fn(x, given_objs, given_cats, y, t):
-                return self.denoise(target_model,given_objs, given_cats, y, x, t, **model_kwargs)[1]
+            def target_denoise_fn(x, mask, given_objs, given_cats, target_cat, y, t):
+                return self.denoise(self, model, mask, given_objs, given_cats, y, x, t, **model_kwargs)[1]
 
         else:
             raise NotImplementedError("Must have a target model")
@@ -165,23 +188,23 @@ class KarrasDenoiser:
         if teacher_model:
 
             @th.no_grad()
-            def teacher_denoise_fn(x, given_objs, given_cats, y, t):
-                return teacher_diffusion.denoise(teacher_model,given_objs, given_cats, y, x, t, **model_kwargs)[1]
+            def teacher_denoise_fn(x, mask, given_objs, given_cats, target_cat, y, t):
+                return teacher_diffusion.denoise(self, model, mask, given_objs, given_cats, y, x_t, t, **model_kwargs)[1]
 
         @th.no_grad()
-        def heun_solver(samples,given_objs, given_cats, y, t, next_t, x0):
+        def heun_solver(mask, given_objs, given_cats, samples, target_cat, y, t, next_t, x0):
             x = samples
             if teacher_model is None:
                 denoiser = x0
             else:
-                denoiser = teacher_denoise_fn(x, given_objs, given_cats, y, t)
+                denoiser = teacher_denoise_fn(x, mask, given_objs, given_cats, target_cat, y, t)
 
             d = (x - denoiser) / append_dims(t, dims)
             samples = x + d * append_dims(next_t - t, dims)
             if teacher_model is None:
                 denoiser = x0
             else:
-                denoiser = teacher_denoise_fn(samples, given_objs, given_cats, y,next_t)
+                denoiser = teacher_denoise_fn(samples, mask, given_objs, given_cats, target_cat, y,next_t)
 
             next_d = (samples - denoiser) / append_dims(next_t, dims)
             samples = x + (d + next_d) * append_dims((next_t - t) / 2, dims)
@@ -189,12 +212,12 @@ class KarrasDenoiser:
             return samples
 
         @th.no_grad()
-        def euler_solver(samples,given_objs, given_cats, y, t, next_t, x0):
+        def euler_solver(mask, given_objs, given_cats, samples, target_cat, y, t, next_t, x0):
             x = samples
             if teacher_model is None:
                 denoiser = x0
             else:
-                denoiser = teacher_denoise_fn(x, given_objs, given_cats, y, t)
+                denoiser = teacher_denoise_fn(x, mask, given_objs, given_cats, target_cat, y, t)
             d = (x - denoiser) / append_dims(t, dims)
             samples = x + d * append_dims(next_t - t, dims)
 
@@ -220,12 +243,12 @@ class KarrasDenoiser:
         distiller = denoise_fn(x_t, t)
 
         if teacher_model is None:
-            x_t2 = euler_solver(x_t, given_objs, given_cats, y, t, t2, x_start).detach()
+            x_t2 = euler_solver(x_t, mask, given_objs, given_cats, target_cat, y, t, t2, x_start).detach()
         else:
-            x_t2 = heun_solver(x_t, given_objs, given_cats, y, t, t2, x_start).detach()
+            x_t2 = heun_solver(x_t, mask, given_objs, given_cats, target_cat, y, t, t2, x_start).detach()
 
         th.set_rng_state(dropout_state)
-        distiller_target = target_denoise_fn(x_t2, t2)
+        distiller_target = target_denoise_fn(x_t2, mask, given_objs, given_cats, target_cat, t2)
         distiller_target = distiller_target.detach()
 
         snrs = self.get_snr(t)
@@ -270,8 +293,7 @@ class KarrasDenoiser:
     def progdist_losses(
         self,
         model,
-        given_objs, given_cats, y,
-        x_start,
+        mask, given_objs, given_cats, x_start, target_cat, y,
         num_scales,
         model_kwargs=None,
         teacher_model=None,
@@ -285,17 +307,17 @@ class KarrasDenoiser:
 
         dims = x_start.ndim
 
-        def denoise_fn(x, given_objs, given_cats, y, t):
-            return self.denoise(model, x, given_objs, given_cats, y, t, **model_kwargs)[1]
+        def denoise_fn(x, t):
+            return self.denoise(model, x, mask, given_objs, given_cats, target_cat, y, t, **model_kwargs)[1]
 
         @th.no_grad()
         def teacher_denoise_fn(x, given_objs, given_cats, y, t):
-            return teacher_diffusion.denoise(teacher_model, x, given_objs, given_cats, y, t, **model_kwargs)[1]
+            return teacher_diffusion.denoise(teacher_model, x, mask, given_objs, given_cats, target_cat, y, t, **model_kwargs)[1]
 
         @th.no_grad()
-        def euler_solver(samples, given_objs, given_cats, y, t, next_t):
+        def euler_solver(samples, mask, given_objs, given_cats, target_cat, y, t, next_t):
             x = samples
-            denoiser = teacher_denoise_fn(x, given_objs, given_cats, y, t)
+            denoiser = teacher_denoise_fn(x, mask, given_objs, given_cats, target_cat, y, t)
             d = (x - denoiser) / append_dims(t, dims)
             samples = x + d * append_dims(next_t - t, dims)
 
@@ -329,8 +351,8 @@ class KarrasDenoiser:
 
         denoised_x = denoise_fn(x_t, given_objs, given_cats, y, t)
 
-        x_t2 = euler_solver(x_t, given_objs, given_cats, y, t, t2).detach()
-        x_t3 = euler_solver(x_t2, given_objs, given_cats, y, t2, t3).detach()
+        x_t2 = euler_solver(x_t, mask, given_objs, given_cats, target_cat, y, t, t2).detach()
+        x_t3 = euler_solver(x_t2, mask, given_objs, given_cats, target_cat, y, t2, t3).detach()
 
         target_x = euler_to_denoiser(x_t, t, x_t3, t3).detach()
 
@@ -361,9 +383,9 @@ class KarrasDenoiser:
 
         return terms
 
-    def denoise(self, model,given_objs, given_cats, y, x_t, sigmas, **model_kwargs):
+    def denoise(self, model, mask, given_objs, given_cats, y, x_t, t, **model_kwargs):
         import torch.distributed as dist
-
+        sigmas = self.get_sigmas_ddpm(self,t)
         if not self.distillation:
             c_skip, c_out, c_in = [
                 append_dims(x, x_t.ndim) for x in self.get_scalings(sigmas)
@@ -371,12 +393,13 @@ class KarrasDenoiser:
         else:
             c_skip, c_out, c_in = [
                 append_dims(x, x_t.ndim)
-                for x in self.get_scalings_for_boundary_condition(sigmas)
+                for x in self.get_scalings_ddpm(sigmas)
             ]
-        rescaled_t = 1000 * 0.25 * th.log(sigmas + 1e-44)
-        predict_cat, model_output = model(c_in * x_t,given_objs, given_cats, y, rescaled_t, **model_kwargs)
+        # rescaled_t = 1000 * 0.25 * th.log(sigmas + 1e-44)
+        rescaled_t = t.float() * (1000.0 / self.num_timesteps)
+        predict_cat, model_output = model(c_in * x_t, mask, rescaled_t, given_objs, given_cats, y, **model_kwargs)
         denoised = c_out * model_output + c_skip * x_t
-        return model_output, denoised
+        return model_output, denoised, predict_cat
 
 
 def karras_sample(

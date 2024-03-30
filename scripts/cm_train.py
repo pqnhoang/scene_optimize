@@ -49,8 +49,6 @@ def main():
         datatype = "proxd"
     elif args.datatype == "humanise":
         datatype = "humanise"
-    else:
-        raise ValueError(f"unknown training mode {args.training_mode}")
     model_and_diffusion_kwargs = args_to_dict(
         args, model_and_diffusion_defaults().keys()
     )

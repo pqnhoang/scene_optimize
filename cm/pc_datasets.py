@@ -136,8 +136,8 @@ class ProxDataset_txt(Dataset):    # when jump_step=8, for a whole seq, dataset'
         target_cat = torch.zeros(self.max_cats)
         target_cat[target_num] = 1
 
-        return obj_mask, {"object_verts": obj_verts,"obj_cats": obj_cats, "target_verts": target_verts,"target_cat": target_cat,"text": text_prompt}
-
+        #return obj_mask, {"object_verts": obj_verts,"obj_cats": obj_cats, "target_verts": target_verts,"target_cat": target_cat,"text": text_prompt}
+        return obj_mask, obj_verts, obj_cats, target_verts, target_cat, text_prompt
 
 class HUMANISE(Dataset):    # when jump_step=8, for a whole seq, dataset's max_frame is 165, max num_seg is 29
     def __init__(self, data_dir, fix_orientation=False, no_obj_classes=8, max_frame=220,
@@ -264,7 +264,8 @@ class HUMANISE(Dataset):    # when jump_step=8, for a whole seq, dataset's max_f
         target_cat = torch.zeros(self.max_cats)
         target_cat[target_num] = 1
 
-        return obj_mask, {"object_verts": obj_verts,"obj_cats": obj_cats, "target_verts": target_verts,"target_cat": target_cat,"text": text_prompt}
+        #return obj_mask, {"object_verts": obj_verts,"obj_cats": obj_cats, "target_verts": target_verts,"target_cat": target_cat,"text": text_prompt}
+        return obj_mask, obj_verts, obj_cats, target_verts, target_cat, text_prompt
 def load_data(*,
     train_data_dir,
     datatype,
@@ -278,8 +279,11 @@ def load_data(*,
     if datatype == "proxd":
         train_dataset = ProxDataset_txt(train_data_dir, max_frame=max_frame, fix_orientation=fix_orientation,
                                     step_multiplier=step_multiplier, jump_step=jump_step)
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
     else:
         train_dataset = HUMANISE(train_data_dir, max_frame=max_frame, fix_orientation=fix_orientation,
                                     step_multiplier=step_multiplier, jump_step=jump_step)
-        train_data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+        data_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+    
+    while True:
+        yield from data_loader
